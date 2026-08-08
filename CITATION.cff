@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: Neurovision
+message: >-
+  If you use this software, please cite both it and the ds002778 dataset it
+  analyses (Rockhill et al., OpenNeuro), together with Jackson et al. (2019)
+  and George et al. (2013) as the dataset authors request.
+type: software
+authors:
+  - name: "Anonymous for review"
+repository-code: "https://github.com/USER/neurovision"
+license: MIT

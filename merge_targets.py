@@ -50,16 +50,42 @@ def parse_args(argv=None):
 
 # --------------------------------------------------------------------------
 def load(dirpath: Path) -> pd.DataFrame:
-    files = sorted(dirpath.glob("*.csv"))
+    """Concatenate the per-target result CSVs in `dirpath`.
+
+    Each sweep writes two CSVs per target, `<CH>.csv` with one row per cell and
+    `<CH>_group_stats.csv` with that target's group contrasts. Only the former
+    belongs here: the latter has entirely different columns, and concatenating
+    it silently appends contrast rows with no `target`, `selection` or `r2`,
+    which then contaminate every downstream mean.
+    """
+    files = sorted(f for f in dirpath.glob("*.csv")
+                   if not f.name.endswith("_group_stats.csv"))
     if not files:
-        raise SystemExit(f"No CSVs in {dirpath}. Run run_all_targets.sh first.")
+        raise SystemExit(
+            f"No per-target CSVs in {dirpath}. Point --dir at a sweep output "
+            f"directory such as results/targets_mine, not at results/ itself.")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+
+    required = {"target", "selection", "r2", "recording"}
+    absent = required - set(df.columns)
+    if absent:
+        raise SystemExit(f"{dirpath}: missing expected columns {sorted(absent)}")
+    bad = df[["target", "selection"]].isna().any(axis=1)
+    if bad.any():
+        print(f"  dropping {int(bad.sum())} rows with no target or selection")
+        df = df[~bad].reset_index(drop=True)
+
     print(f"Merged {len(files)} targets, {len(df)} rows, "
           f"{df.recording.nunique()} recordings, {df.target.nunique()} targets")
-    missing = set(df.target.unique()) ^ set(f.stem for f in files)
+
+    # Compare as strings: a stray NaN in the target column would otherwise make
+    # sorted() raise on a mixed float/str set.
+    from_csv = {str(t) for t in df.target.dropna().unique()}
+    from_name = {f.stem for f in files}
+    missing = from_csv ^ from_name
     if missing:
-        print(f"  note: filenames and recorded targets differ for {sorted(missing)}; "
-              f"the 'target' column is authoritative")
+        print(f"  note: filenames and recorded targets differ for "
+              f"{sorted(missing)}; the 'target' column is authoritative")
     return df
 
 

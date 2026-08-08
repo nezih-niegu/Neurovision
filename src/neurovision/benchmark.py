@@ -32,14 +32,18 @@ Example
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 
 from neurovision import core as mc
 from neurovision import mine as mi_nn
+from neurovision.progress import Progress
 
 
 def parse_args(argv=None):
@@ -77,9 +81,16 @@ def parse_args(argv=None):
                    help="edge weight used to rank channels, computed on the "
                         "training block only. pearson and distance are baselines: "
                         "if either ranks as well as MI, the graph adds nothing")
-    p.add_argument("--predictor", default="mlp", choices=["mlp", "ridge"],
-                   help="ridge is a linear baseline; if it matches the MLP, the "
-                        "reconstruction needs no nonlinearity")
+    p.add_argument("--predictor", default="mlp",
+                   choices=["mlp", "ridge", "mine"],
+                   help="mlp = MSE only; ridge = linear baseline; mine = the "
+                        "same MLP trained with an auxiliary MI term on its "
+                        "representation. mlp and mine differ in exactly one "
+                        "loss term, so comparing them isolates the value of "
+                        "MINE as a training signal rather than a measurement")
+    p.add_argument("--mine-lambda", type=float, default=0.1,
+                   help="weight on the MI term when --predictor mine; 0 makes "
+                        "it identical to the plain MLP")
 
     g = p.add_argument_group("trace plots")
     g.add_argument("--trace-seconds", type=float, default=6.0,
@@ -115,7 +126,61 @@ def parse_args(argv=None):
                    help="MINE training steps; 0 skips the MI estimation")
     g.add_argument("--mine-batch", type=int, default=512)
     g.add_argument("--seed", type=int, default=0)
+
+    g = p.add_argument_group("performance")
+    g.add_argument("--jobs", type=int, default=1,
+                   help="worker processes over recordings; the fits are tiny "
+                        "and independent, so this is where the parallelism is. "
+                        "0 = all cores but one")
+    g.add_argument("--cache-dir", default=".preproc_cache",
+                   help="reuse preprocessed arrays across runs; empty disables")
     return p.parse_args(argv)
+
+
+def _cache_key(path, args):
+    """Identity of a preprocessed array: the file plus everything shaping it."""
+    parts = [str(path), args.reference, args.band, str(args.sfreq),
+             str(args.notch), str(args.tmin), str(args.duration),
+             args.montage, str(args.n_channels)]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def load_cached(rec, args):
+    """Preprocess one recording, reusing a cached array when one exists.
+
+    Preprocessing is about 1% of a single target's cost, but it is repeated for
+    every target and every baseline configuration, which across a full study is
+    hours. The key covers every parameter that affects the output, so a changed
+    filter or reference misses rather than returning something stale.
+    """
+    cdir = Path(args.cache_dir) if args.cache_dir else None
+    f = cdir / f"{_cache_key(rec.path, args)}.npz" if cdir else None
+    if f is not None and f.exists():
+        try:
+            z = np.load(f, allow_pickle=False)
+            return (z["data"], [str(c) for c in z["names"]],
+                    json.loads(str(z["meta"])))
+        except Exception:
+            pass                      # partial or corrupt entry: recompute
+
+    data, names, meta = mc.load_and_preprocess(
+        rec.path, picks=None, sfreq=args.sfreq, notch=args.notch or None,
+        tmin=args.tmin, duration=args.duration or None,
+        montage_name=args.montage, reference=args.reference)
+    if args.n_channels:
+        data, names = data[: args.n_channels], names[: args.n_channels]
+    if args.band != "broadband":
+        data = mc.band_filter(data, meta["sfreq"], mc.BANDS[args.band])
+
+    if f is not None:
+        cdir.mkdir(parents=True, exist_ok=True)
+        # savez_compressed appends .npz unless the name already ends in it, so
+        # the temp name must too, or the rename below looks for the wrong file.
+        tmp = f.with_name(f"{f.stem}.{os.getpid()}.tmp.npz")
+        np.savez_compressed(tmp, data=data.astype(np.float32),
+                            names=np.array(names), meta=np.array(json.dumps(meta)))
+        os.replace(tmp, f)            # atomic: parallel workers cannot race
+    return data, names, meta
 
 
 def pearson_matrix(x: np.ndarray) -> np.ndarray:
@@ -176,6 +241,11 @@ def run_cell(data, target, sources, window, args, dev, seed):
 
     if args.predictor == "ridge":
         pred = mi_nn.fit_ridge(Xtr, ytr, Xte, yte)
+    elif args.predictor == "mine":
+        pred = mi_nn.train_predictor_mine(
+            Xtr, ytr, Xte, yte, device=dev, epochs=args.epochs,
+            batch_size=args.batch_size, lr=args.lr, hidden=args.hidden,
+            lam=args.mine_lambda, seed=seed)
     else:
         pred = mi_nn.train_predictor(
             Xtr, ytr, Xte, yte, device=dev, epochs=args.epochs,
@@ -229,23 +299,19 @@ def main(argv=None):
     # target (the old default) would confound group with target identity.
     print("\nLoading and preprocessing...")
     loaded = []
+    pre_bar = Progress(len(recs), "preprocess")
     for rec in recs:
         try:
-            data, names, meta = mc.load_and_preprocess(
-                rec.path, picks=None, sfreq=args.sfreq, notch=args.notch or None,
-                tmin=args.tmin, duration=args.duration or None,
-                montage_name=args.montage, reference=args.reference)
+            data, names, meta = load_cached(rec, args)
         except Exception as exc:
             print(f"   {rec.label}: FAILED ({exc})")
             continue
-        if args.n_channels:
-            data, names = data[: args.n_channels], names[: args.n_channels]
-        if args.band != "broadband":
-            data = mc.band_filter(data, meta["sfreq"], mc.BANDS[args.band])
         if len(names) < args.k + 2:
             sys.exit(f"Need at least {args.k + 2} channels, have {len(names)}")
         cut = int(data.shape[1] * (1 - args.test_frac)) - args.gap
         loaded.append((rec, data, names, meta, mc.gcmi_matrix(data[:, :cut])))
+        pre_bar.update(note=rec.label)
+    pre_bar.close()
     if not loaded:
         sys.exit("Every recording failed to load.")
 
@@ -280,66 +346,108 @@ def main(argv=None):
     return finish(rows, rank_info, trace_store, args, dev, targets, names0)
 
 
+def _recording_job(job):
+    """All cells for one recording and one target. Module level so it pickles.
+
+    Returns plain data rather than mutating shared state, because the caller may
+    be running this in a separate process.
+    """
+    ri, label, group, subject, session, rec_path, target, args, seed = job
+    # The array is re-read from the preprocessing cache rather than shipped
+    # through the pickle queue. With spawn (the macOS default) every job payload
+    # is serialised up front, so passing 46 arrays of a few MB each put hundreds
+    # of MB into the queue before any work started.
+    from types import SimpleNamespace
+    data, names, _ = load_cached(SimpleNamespace(path=rec_path), args)
+    try:
+        import torch
+        torch.set_num_threads(1)   # the pool supplies the parallelism; letting
+                                   # each worker grab every core makes them all
+                                   # slower
+    except Exception:
+        pass
+    # Metal contexts are not safe to create in several processes at once: on
+    # macOS this manifests as a wedged run or, worse, a machine reset. Workers
+    # therefore always use the CPU; the models are small enough that this costs
+    # little, and the parallelism more than covers it.
+    dev = torch.device("cpu") if args.jobs != 1 else mi_nn.pick_device(args.device)
+    cut = int(data.shape[1] * (1 - args.test_frac)) - args.gap
+    train_block = data[:, :cut]
+    order, mi_mat = rank_channels(train_block, target, args.rank_estimator,
+                                  ch_names=names, montage=args.montage)
+    dist_mat = distance_matrix(names, args.montage)
+    rng = np.random.default_rng(seed)
+
+    picks = {}
+    if "top" in args.selections:
+        picks["top"] = order[: args.k]
+    if "bottom" in args.selections:
+        picks["bottom"] = order[-args.k:]
+    if "random" in args.selections:
+        pool = [i for i in range(len(names)) if i != target]
+        picks["random"] = rng.choice(pool, args.k, replace=False)
+    if "all" in args.selections:
+        picks["all"] = np.array([i for i in range(len(names)) if i != target])
+    if "nearest" in args.selections:
+        others = np.array([i for i in range(len(names)) if i != target])
+        picks["nearest"] = others[np.argsort(-dist_mat[target][others])][: args.k]
+    if "single" in args.selections:
+        picks["single"] = order[:1]
+
+    rows, traces, info = [], {}, []
+    for tag, sel in picks.items():
+        mis = float(np.nanmean(mi_mat[target][sel]))
+        info.append(dict(recording=label, group=group, subject=subject,
+                         target=names[target], selection=tag,
+                         channels=[names[i] for i in sel],
+                         mean_pairwise_mi=mis))
+        for w in args.windows:
+            if w > train_block.shape[1] // 4:
+                continue
+            row, tr = run_cell(data, target, sel, w, args, dev, seed)
+            if tr is not None:
+                traces[(label, names[target], tag, w)] = tr
+            row.update(recording=label, group=group, subject=subject,
+                       session=session, edge_weight=args.rank_estimator,
+                       predictor=args.predictor,
+                       mine_lambda=(args.mine_lambda
+                                    if args.predictor == "mine" else 0.0),
+                       target=names[target],
+                       selection=tag, k=len(sel), mean_pairwise_mi=mis)
+            rows.append(row)
+    return ri, rows, traces, info
+
+
 def run_target(target, loaded, args, dev, rows, rank_info, trace_store):
-    """One target channel, every recording. Appends to the shared accumulators."""
-    import numpy as np
-    for ri, (rec, data, names, meta, _) in enumerate(loaded):
-        cut = int(data.shape[1] * (1 - args.test_frac)) - args.gap
-        train_block = data[:, :cut]
-        order, mi_mat = rank_channels(train_block, target, args.rank_estimator,
-                                      ch_names=names, montage=args.montage)
-        dist_mat = distance_matrix(names, args.montage)
-        rng = np.random.default_rng(args.seed + ri)
+    """One target channel over every recording, optionally across processes."""
+    names0 = loaded[0][2]
+    jobs = [(ri, rec.label, rec.group, rec.subject, rec.session, rec.path,
+             target, args, args.seed + ri)
+            for ri, (rec, data, names, meta, _) in enumerate(loaded)]
 
-        picks = {}
-        if "top" in args.selections:
-            picks["top"] = order[: args.k]
-        if "bottom" in args.selections:
-            picks["bottom"] = order[-args.k:]
-        if "random" in args.selections:
-            pool = [i for i in range(len(names)) if i != target]
-            picks["random"] = rng.choice(pool, args.k, replace=False)
-        if "all" in args.selections:
-            picks["all"] = np.array([i for i in range(len(names)) if i != target])
-        if "nearest" in args.selections:
-            d = dist_mat[target].copy()
-            others = np.array([i for i in range(len(names)) if i != target])
-            picks["nearest"] = others[np.argsort(-d[others])][: args.k]
-        if "single" in args.selections:
-            picks["single"] = order[:1]
+    n_jobs = args.jobs if args.jobs > 0 else max((os.cpu_count() or 2) - 1, 1)
+    n_jobs = max(1, min(n_jobs, len(jobs)))
+    if n_jobs > 1 and mi_nn.pick_device(args.device).type == "mps":
+        print("  note: workers run on CPU; Metal is not multi-process safe")
 
-        print(f"\n[{ri+1}/{len(loaded)}] {rec.label} [{rec.group}] — "
-              f"target {names[target]}, {len(names)} channels, "
-              f"{meta['duration_s']:.0f}s")
-        for tag, sel in picks.items():
-            mis = mi_mat[target][sel]
-            print(f"   {tag:6s}: {', '.join(names[i] for i in sel)}  "
-                  f"(train MI {np.nanmean(mis):.3f} bits)")
-            rank_info.append(dict(recording=rec.label, group=rec.group,
-                                  subject=rec.subject, target=names[target],
-                                  selection=tag,
-                                  channels=[names[i] for i in sel],
-                                  mean_pairwise_mi=float(np.nanmean(mis))))
+    bar = Progress(len(jobs), f"target {names0[target]}")
+    def absorb(res):
+        _, rws, trs, info = res
+        rows.extend(rws); rank_info.extend(info); trace_store.update(trs)
+        top = [r["r2"] for r in rws if r["selection"] == "top"]
+        lab = rws[0]["recording"] if rws else ""
+        bar.update(note=f"{lab} top R2={np.mean(top):+.3f}" if top else lab)
 
-        for tag, sel in picks.items():
-            for w in args.windows:
-                if w > train_block.shape[1] // 4:
-                    continue
-                row, traces = run_cell(data, target, sel, w, args, dev,
-                                       args.seed + ri)
-                if traces is not None:
-                    trace_store[(rec.label, names[target], tag, w)] = traces
-                row.update(recording=rec.label, group=rec.group,
-                           subject=rec.subject, session=rec.session,
-                           edge_weight=args.rank_estimator,
-                           predictor=args.predictor,
-                           target=names[target], selection=tag, k=len(sel),
-                           mean_pairwise_mi=float(np.nanmean(mi_mat[target][sel])))
-                rows.append(row)
-                extra = (f"  MINE {row['mine_bits']:.2f} b"
-                         if "mine_bits" in row else "")
-                print(f"   {tag:6s} w={w:4d} ({row['window_ms']:6.0f} ms)  "
-                      f"R2 = {row['r2']:+.3f}{extra}")
+    if n_jobs == 1:
+        for job in jobs:
+            absorb(_recording_job(job))
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futs = [ex.submit(_recording_job, j) for j in jobs]
+            for fut in as_completed(futs):
+                absorb(fut.result())
+    bar.close()
+
 
 def finish(rows, rank_info, trace_store, args, dev, targets, names0):
     """Aggregate, test, plot and write. Shared by single- and multi-target runs."""

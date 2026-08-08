@@ -35,6 +35,7 @@ from scipy import stats
 
 from neurovision import core as mc
 from neurovision import mine as mi_nn
+from neurovision.progress import Progress
 
 
 def parse_args(argv=None):
@@ -121,6 +122,7 @@ def main(argv=None):
         cut = int(data.shape[1] * (1 - args.test_frac)) - args.gap
         MI = mc.gcmi_matrix(data[:, :cut])          # ranking MI, train block only
 
+        bar = Progress(n_ch * (n_ch - 1), f"{rec.label} pairs")
         for t in range(n_ch):
             for src in range(n_ch):
                 if src == t:
@@ -137,9 +139,11 @@ def main(argv=None):
                                  target=names[t], source=names[src],
                                  mi_bits=float(MI[t, src]),
                                  distance=float(D[t, src]), r2=r.r2))
+                bar.update(note=f"{names[t]}<-{names[src]}")
+        bar.close()
         eta = (time.time() - t0) / (ri + 1) * (len(recs) - ri - 1)
         print(f"  [{ri+1}/{len(recs)}] {rec.label:22s} [{rec.group:6s}]  "
-              f"ETA {eta/60:.1f} min")
+              f"recording ETA {eta/60:.1f} min")
 
     df = pd.DataFrame(rows)
     out = Path(args.out)

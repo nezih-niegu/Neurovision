@@ -11,6 +11,11 @@
 #
 # All variables: CHANNELS WINDOWS MINE_ITERS K DURATION REFERENCE
 #                RANK_ESTIMATOR PREDICTOR SELECTIONS BAND OUTDIR
+#                JOBS CACHE DEVICE
+#
+# Parallelism lives inside each run now (JOBS workers over recordings), so run
+# one configuration at a time with a high JOBS rather than several configs at
+# once: the latter re-reads and re-preprocesses the same recordings N times.
 #
 # Each target writes results/targets/<CH>.csv etc. Already-completed targets are
 # skipped, so the script is safe to interrupt and restart.
@@ -24,13 +29,19 @@ DURATION=${DURATION:-180}
 REFERENCE=${REFERENCE:-average}
 RANK_ESTIMATOR=${RANK_ESTIMATOR:-gcmi}
 PREDICTOR=${PREDICTOR:-mlp}
+MINE_LAMBDA=${MINE_LAMBDA:-0.1}
 SELECTIONS=${SELECTIONS:-"top random bottom"}
 BAND=${BAND:-broadband}
+JOBS=${JOBS:-0}          # 0 = all cores but one
+QUIET=${QUIET:-0}        # 1 = write logs only, no screen output
+CACHE=${CACHE:-.preproc_cache}
+DEVICE=${DEVICE:-auto}
 OUTDIR=${OUTDIR:-results/targets}
 
 mkdir -p "$OUTDIR"
 total=$(echo "$CHANNELS" | wc -w | tr -d ' ')
 i=0
+ran=0
 start=$(date +%s)
 
 for ch in $CHANNELS; do
@@ -49,12 +60,16 @@ for ch in $CHANNELS; do
       --reference "$REFERENCE" \
       --rank-estimator "$RANK_ESTIMATOR" \
       --predictor "$PREDICTOR" \
+      --mine-lambda "$MINE_LAMBDA" \
       --selections $SELECTIONS \
       --band "$BAND" \
       --mine-iters "$MINE_ITERS" \
+      --jobs "$JOBS" \
+      --cache-dir "$CACHE" \
+      --device "$DEVICE" \
       --no-traces \
       --out "$out" \
-      > "$out.log" 2>&1
+      2>&1 | tee "$out.log" | { [ "${QUIET:-0}" = 1 ] && cat > /dev/null || sed "s/^/     /"; }
   # Summarise via the project environment: bare python3 is the system
   # interpreter and has none of the project's dependencies.
   summary=$(uv run python -c "
@@ -62,7 +77,12 @@ import pandas as pd
 d = pd.read_csv('$out.csv')
 print('target=%s, mean top R2=%.3f' % (d.target.iloc[0], d[d.selection=='top'].r2.mean()))
 " 2>/dev/null || echo "written")
-  echo "     done ($summary)"
+  now=$(date +%s); el=$(( now - start ))
+  # done counts only targets actually run in this invocation, so the estimate
+  # stays honest when earlier targets were skipped as already complete.
+  ran=$(( ran + 1 )); per=$(( el / ran )); left=$(( (total - i) * per ))
+  printf "     done (%s) — %dm elapsed, ~%dm left\n" \
+      "$summary" "$(( el / 60 ))" "$(( left / 60 ))"
 done
 
 elapsed=$(( $(date +%s) - start ))

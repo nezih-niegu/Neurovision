@@ -374,3 +374,32 @@ def test_trace_figures_are_split_by_target(tmp_path):
     assert len(made) == 2
     assert len({p.name for p in made}) == 2
     assert any("Cz" in p.name for p in made) and any("Pz" in p.name for p in made)
+
+
+# --------------------------------------------------------------------------
+# MINE as a training signal, not just a measurement
+# --------------------------------------------------------------------------
+def test_mine_predictor_with_zero_lambda_matches_a_plain_mlp():
+    """lambda = 0 must remove the MI term entirely, so the two arms of the
+    comparison differ in one term and nothing else."""
+    from neurovision.mine import train_predictor_mine
+    rng = np.random.default_rng(20)
+    X = rng.standard_normal((3000, 8)).astype(np.float32)
+    y = (X @ rng.standard_normal(8).astype(np.float32)
+         + 0.3 * rng.standard_normal(3000)).astype(np.float32)
+    Xtr, ytr, Xte, yte = split_contiguous(X, y, 0.25)
+    a = train_predictor_mine(Xtr, ytr, Xte, yte, epochs=20, lam=0.0, seed=0)
+    b = train_predictor_mine(Xtr, ytr, Xte, yte, epochs=20, lam=0.0, seed=0)
+    assert a.r2 == pytest.approx(b.r2, abs=1e-9)   # deterministic given a seed
+    assert a.r2 > 0.8                              # and it actually learns
+
+
+def test_mine_predictor_runs_and_is_bounded_with_lambda():
+    from neurovision.mine import train_predictor_mine
+    rng = np.random.default_rng(21)
+    X = rng.standard_normal((2500, 6)).astype(np.float32)
+    y = np.tanh(X[:, 0] * 2).astype(np.float32) + 0.3 * rng.standard_normal(2500).astype(np.float32)
+    Xtr, ytr, Xte, yte = split_contiguous(X, y, 0.25)
+    r = train_predictor_mine(Xtr, ytr, Xte, yte, epochs=20, lam=0.2, seed=0)
+    assert np.isfinite(r.r2) and r.r2 <= 1.0
+    assert r.y_true.shape == r.y_pred.shape == yte.shape
